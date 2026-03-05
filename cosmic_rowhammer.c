@@ -1,18 +1,47 @@
 /*
  * CosmicRowhammer - Distributed Cosmic Ray Bit Flip Observer
  * Author: Dr. Antonio Nappa / FuzzSociety
- * Version: 0.2.0
+ * Version: 0.4.0
  *
  * Allocates a 512 MB sandboxed memory arena divided into five typed
  * sentinel regions — including a PTE simulation layer — and continuously
  * scans for bit flips induced by cosmic ray Single Event Upsets (SEUs).
  *
  * Each flip is classified by exploitability primitive, accumulated into a
- * 72-hour anonymised report, and optionally POSTed to a remote endpoint.
+ * configurable-window anonymised report, and optionally POSTed to a remote
+ * endpoint.
  *
  * Compile (no curl):  gcc -O2 -Wall -o cosmic_rowhammer cosmic_rowhammer.c -lm
  * Compile (curl):     gcc -O2 -Wall -DWITH_CURL -o cosmic_rowhammer cosmic_rowhammer.c -lm -lcurl
  * Run:                sudo ./cosmic_rowhammer [options]
+ *
+ * Report window examples:
+ *   --report-window 10s    (10 seconds,  for testing)
+ *   --report-window 30m    (30 minutes)
+ *   --report-window 6h     (6 hours)
+ *   --report-window 3d     (3 days,  default = 3d)
+ *
+ * Docker / container notes (false-positive sources):
+ *
+ *  1. MADV_HUGEPAGE + khugepaged: the host kernel's THP collapse daemon
+ *     asynchronously promotes 4 KB pages to 2 MB pages, briefly unmapping
+ *     them during the copy.  This creates transient stale reads in the scan
+ *     that look like bit flips.  Fix: MADV_NOHUGEPAGE (default here).
+ *
+ *  2. KSM (Kernel Samepage Merging): if the host has /sys/kernel/mm/ksm/run=1,
+ *     the large uniform sentinel regions are perfect merge candidates.  KSM
+ *     marks merged pages CoW-read-only; the restore write in scan_arena triggers
+ *     a CoW fault, and the new private page may briefly read back as zero on the
+ *     next scan pass.  Fix: MADV_UNMERGEABLE (applied here, needs --privileged
+ *     or CAP_SYS_ADMIN on some kernels, but silently ignored if unavailable).
+ *
+ *  3. Volatile reads: without the volatile qualifier on scan reads, the compiler
+ *     can hoist or CSE loads under -O2, making the scan read a stale register
+ *     value instead of DRAM.  On ARM Docker hosts the weak memory model amplifies
+ *     this.  Fix: cast to volatile uint64_t * inside scan_arena (done here).
+ *
+ *  Required Docker flags:  --cap-add IPC_LOCK  (for mlock)
+ *  Recommended:            --cap-add SYS_ADMIN (for MADV_UNMERGEABLE on older kernels)
  */
 
 #include <stdio.h>
@@ -24,9 +53,13 @@
 #include <signal.h>
 #include <errno.h>
 #include <math.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/utsname.h>
 #include <sys/sysinfo.h>
+#include <sys/resource.h>   /* getrlimit — mlock limit check        */
+#include <sys/stat.h>
+#include <cpuid.h>          /* GCC built-in CPUID (x86 only)        */
 
 #ifdef WITH_CURL
 #  include <curl/curl.h>
@@ -38,11 +71,15 @@
 
 #define ARENA_SIZE        (512UL * 1024 * 1024)   /* 512 MB total             */
 #define REGION_COUNT      5                        /* five typed regions       */
-#define REGION_SIZE       (ARENA_SIZE / REGION_COUNT) /* ~102 MB each         */
+/* Round down to nearest 8-byte multiple so every region base and every word
+ * index within a region is naturally 8-byte aligned.  Without this,
+ * ARENA_SIZE/REGION_COUNT = 0x6666666 (% 8 = 6), leaving a 6-byte uninitialised
+ * gap at each boundary that scan_arena reads as a corrupt 64-bit word.       */
+#define REGION_SIZE       ((ARENA_SIZE / REGION_COUNT) & ~7UL)  /* 0x6666660  */
 #define SCAN_INTERVAL_S   5                        /* seconds between scans    */
 #define MAX_FLIPS         8192                     /* ring buffer capacity     */
-#define REPORT_WINDOW_S   (72 * 3600)              /* 72-hour report window    */
-#define VERSION           "0.2.0"
+#define DEFAULT_REPORT_S  (72 * 3600)              /* 72-hour default window   */
+#define VERSION           "0.5.0"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * x86-64 PTE Bit Definitions  (Intel SDM Vol.3A §4.5)
@@ -70,7 +107,11 @@
 #define PTE_BIT_D       6   /* Dirty                */
 #define PTE_BIT_NX      63  /* No-Execute           */
 #define PTE_PA_SHIFT    12  /* Physical addr starts at bit 12 */
-#define PTE_PA_MASK     UINT64_C(0x000FFFFFFFFF000) /* bits 51:12 */
+
+/* FIX: original mask 0x000FFFFFFFFF000 was missing one hex nibble.
+ * x86-64 PTE physical address field occupies bits [51:12] = 40 bits.
+ * Correct mask: bits 51 down to 12 set = 0x000FFFFFFFFFF000              */
+#define PTE_PA_MASK     UINT64_C(0x000FFFFFFFFFF000)
 
 /*
  * Canonical "safe" PTE value used to fill the PTE_SIM region:
@@ -162,7 +203,7 @@ typedef struct {
 } FlipEvent;
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 72-hour Report Accumulator
+ * Report Accumulator
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
@@ -182,15 +223,16 @@ typedef struct {
  * Global State
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static uint8_t     *arena           = NULL;
+static uint8_t     *arena              = NULL;
 static FlipEvent    flip_ring[MAX_FLIPS];
-static size_t       flip_head       = 0;
-static size_t       flip_total      = 0;
-static volatile int running         = 1;
-static char         report_url[512] = {0};
-static int          opt_altitude    = -1;   /* metres, -1 = not set  */
-static int          opt_interval    = SCAN_INTERVAL_S;
-static ReportWindow report_win      = {0};
+static size_t       flip_head          = 0;
+static size_t       flip_total         = 0;
+static volatile int running            = 1;
+static char         report_url[512]    = {0};
+static int          opt_altitude       = -1;   /* metres, -1 = not set  */
+static int          opt_interval       = SCAN_INTERVAL_S;
+static long         opt_report_window  = DEFAULT_REPORT_S; /* configurable */
+static ReportWindow report_win         = {0};
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Helpers
@@ -208,27 +250,181 @@ static int count_flipped_bits(uint64_t a, uint64_t b) {
     return __builtin_popcountll(a ^ b);
 }
 
+/* ─── Report window parser ─────────────────────────────────────────────────
+ * Accepts:  10s  30m  6h  3d  (or bare integer = seconds)
+ * Returns:  seconds, or -1 on parse error
+ * ─────────────────────────────────────────────────────────────────────────*/
+static long parse_report_window(const char *s) {
+    if (!s || !*s) return -1;
+    char *end = NULL;
+    long val = strtol(s, &end, 10);
+    if (end == s || val <= 0) return -1;   /* no digits or non-positive */
+
+    if (*end == '\0' || *end == 's' || *end == 'S') return val;
+    if (*end == 'm'  || *end == 'M') return val * 60L;
+    if (*end == 'h'  || *end == 'H') return val * 3600L;
+    if (*end == 'd'  || *end == 'D') return val * 86400L;
+
+    return -1;  /* unknown suffix */
+}
+
+/* Pretty-print seconds as "Xd Yh Zm Ws" (omitting zero fields) */
+static const char *fmt_duration(long secs, char *buf, size_t n) {
+    long d = secs / 86400, h = (secs % 86400) / 3600;
+    long m = (secs % 3600) / 60,  s = secs % 60;
+    char tmp[64] = {0};
+    if (d) snprintf(tmp + strlen(tmp), sizeof(tmp) - strlen(tmp), "%ldd ", d);
+    if (h) snprintf(tmp + strlen(tmp), sizeof(tmp) - strlen(tmp), "%ldh ", h);
+    if (m) snprintf(tmp + strlen(tmp), sizeof(tmp) - strlen(tmp), "%ldm ", m);
+    if (s || !tmp[0]) snprintf(tmp + strlen(tmp), sizeof(tmp) - strlen(tmp), "%lds", s);
+    /* trim trailing space */
+    size_t l = strlen(tmp);
+    if (l > 0 && tmp[l-1] == ' ') tmp[l-1] = '\0';
+    snprintf(buf, n, "%s", tmp);
+    return buf;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Container / Environment Detection
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Returns 1 if we appear to be running inside a container (Docker / LXC / etc.) */
+static int detect_container(void) {
+    /* Most reliable: Docker always creates /.dockerenv                  */
+    if (access("/.dockerenv", F_OK) == 0) return 1;
+    /* cgroup v1: docker sets a non-trivial cgroup path                  */
+    FILE *f = fopen("/proc/1/cgroup", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "docker") || strstr(line, "lxc") ||
+                strstr(line, "containerd") || strstr(line, "kubepods")) {
+                fclose(f); return 1;
+            }
+        }
+        fclose(f);
+    }
+    return 0;
+}
+
+/* Check cgroup v1 memory limit; returns bytes or 0 if unlimited / unavailable */
+static uint64_t cgroup_mem_limit(void) {
+    const char *paths[] = {
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        "/sys/fs/cgroup/memory.max",          /* cgroup v2 */
+        NULL
+    };
+    for (int i = 0; paths[i]; i++) {
+        FILE *f = fopen(paths[i], "r");
+        if (!f) continue;
+        uint64_t val = 0;
+        if (fscanf(f, "%llu", (unsigned long long *)&val) == 1) {
+            fclose(f);
+            /* Kernel uses 9223372036854771712 (near UINT64_MAX) for "unlimited" */
+            if (val > (uint64_t)8 * 1024 * 1024 * 1024 * 1024ULL) return 0;
+            return val;
+        }
+        fclose(f);
+    }
+    return 0;
+}
+
+/* Check if host KSM is active */
+static int ksm_active(void) {
+    FILE *f = fopen("/sys/kernel/mm/ksm/run", "r");
+    if (!f) return 0;
+    int v = 0;
+    if (fscanf(f, "%d", &v) != 1) v = 0;
+    fclose(f);
+    return v;
+}
+
+/* Check host THP policy */
+static const char *thp_policy(void) {
+    FILE *f = fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
+    if (!f) return "unknown";
+    static char buf[64]; buf[0] = '\0';
+    if (!fgets(buf, sizeof(buf), f)) buf[0] = '\0';
+    fclose(f);
+    /* File contains e.g. "always [madvise] never" — extract the bracketed one */
+    char *s = strchr(buf, '[');
+    char *e = s ? strchr(s, ']') : NULL;
+    if (s && e) { *e = '\0'; return s + 1; }
+    return buf;
+}
+
+
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Arena Allocation
+ *
+ * Key decisions for container environments:
+ *
+ *  MADV_NOHUGEPAGE  — prevents khugepaged from asynchronously promoting our
+ *                     4 KB sentinel pages to 2 MB THP during a scan pass,
+ *                     which would cause transient stale reads (false flips).
+ *
+ *  MADV_UNMERGEABLE — tells KSM not to merge our pages with any others.
+ *                     Without this, the large uniform sentinel regions are
+ *                     prime KSM targets; a merged CoW restore write triggers
+ *                     a kernel page-copy that looks like a flip on the next
+ *                     scan.  Requires CAP_SYS_ADMIN on some kernel versions;
+ *                     failure is non-fatal (we warn and continue).
+ *
+ *  MADV_DONTDUMP    — omit the 512 MB arena from core dumps; speeds up crash
+ *                     handling and prevents accidental sentinel-data leaks.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static uint8_t *alloc_arena(void) {
+    /* Check cgroup limit before attempting mlock */
+    uint64_t cg_limit = cgroup_mem_limit();
+    if (cg_limit > 0 && cg_limit < ARENA_SIZE) {
+        fprintf(stderr,
+            "[!] WARNING: cgroup memory limit is %llu MB — arena is 512 MB.\n"
+            "    mlock will likely fail or pages will be reclaimed under pressure.\n"
+            "    Run with: docker run --memory 768m  (or larger)\n\n",
+            (unsigned long long)(cg_limit / (1024*1024)));
+    }
+
     void *p = mmap(NULL, ARENA_SIZE,
                    PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
                    -1, 0);
     if (p == MAP_FAILED) { perror("mmap"); return NULL; }
 
-#ifdef MADV_HUGEPAGE
-    madvise(p, ARENA_SIZE, MADV_HUGEPAGE);
+    /* ── Disable THP: prevents khugepaged false-positive flips ── */
+#ifdef MADV_NOHUGEPAGE
+    if (madvise(p, ARENA_SIZE, MADV_NOHUGEPAGE) != 0)
+        fprintf(stderr, "[~] MADV_NOHUGEPAGE unavailable (%s) — THP may cause false positives\n",
+                strerror(errno));
 #endif
 
-    if (mlock(p, ARENA_SIZE) != 0)
-        fprintf(stderr, "[!] mlock failed (%s) — run as root for reliable results\n",
+    /* ── Disable KSM merging: prevents CoW-restore false-positive flips ── */
+#ifdef MADV_UNMERGEABLE
+    if (madvise(p, ARENA_SIZE, MADV_UNMERGEABLE) != 0)
+        fprintf(stderr, "[~] MADV_UNMERGEABLE failed (%s) — add --cap-add SYS_ADMIN if KSM is active\n",
                 strerror(errno));
+#endif
+
+    /* ── Omit from core dumps ── */
+#ifdef MADV_DONTDUMP
+    madvise(p, ARENA_SIZE, MADV_DONTDUMP);
+#endif
+
+    /* ── Lock pages: requires CAP_IPC_LOCK or root ── */
+    if (mlock(p, ARENA_SIZE) != 0)
+        fprintf(stderr,
+            "[!] mlock failed (%s)\n"
+            "    Without locked pages, the kernel may swap/reclaim arena pages\n"
+            "    between spray and scan, causing false positives.\n"
+            "    Ensure: docker run --cap-add IPC_LOCK, run as root, cgroup limit >= 768 MB\n",
+            strerror(errno));
+    else
+        printf("[+] Arena mlocked — pages pinned in RAM.\n");
 
     return (uint8_t *)p;
 }
+
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * PTE Simulation Fill
@@ -243,8 +439,6 @@ static uint8_t *alloc_arena(void) {
 
 /* Fixed control bits for the canonical safe PTE (NX=1, U=1, RW=1, P=1) */
 #define PTE_CTRL_BITS   UINT64_C(0x8000000000000007)
-/* Mask covering the physical-address field bits [51:12] */
-#define PTE_ADDR_MASK   UINT64_C(0x000FFFFFFFFF000)
 
 static inline uint64_t pte_for_index(size_t i) {
     /* Physical PFN cycles through a 20-bit space — avoids bit collisions
@@ -303,14 +497,15 @@ static uint64_t expected_at(size_t byte_off) {
 static FlipClass classify_pte_flip(uint64_t expected, uint64_t observed) {
     uint64_t diff = expected ^ observed;
 
-    /* NX bit cleared: 1→0 → non-exec page becomes executable */
+    /* NX bit cleared: 1→0 → non-exec page becomes executable
+     * Checked first — highest exploitability severity               */
     if ((diff >> PTE_BIT_NX) & 1) {
         if (!((observed >> PTE_BIT_NX) & 1))   /* was 1, now 0 */
             return PTE_NX_CLEAR;
     }
 
     /* Physical address bits corrupted → arbitrary memory aliasing */
-    if (diff & PTE_ADDR_MASK)
+    if (diff & PTE_PA_MASK)
         return PTE_PHYS_CORRUPT;
 
     /* Present bit cleared: 1→0 → page-fault loop / DoS */
@@ -342,7 +537,9 @@ static FlipClass classify_pte_flip(uint64_t expected, uint64_t observed) {
 static FlipClass classify_flip(RegionType region, uint64_t expected,
                                 uint64_t observed, int direction, int n_bits) {
     /* Multi-bit single-word flips are statistically improbable for cosmic
-     * rays — flag as benign / noise to avoid false positives.            */
+     * rays — flag as benign / noise to avoid false positives.
+     * Threshold >2 kept intentionally: genuine double-bit events exist
+     * near the Bragg peak, but >2 is almost certainly electrical noise.  */
     if (n_bits > 2) return FLIP_BENIGN;
 
     switch (region) {
@@ -362,10 +559,16 @@ static FlipClass classify_flip(RegionType region, uint64_t expected,
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Read Spray  (observation — no writes)
+ *
+ * Touches every page (stride = one cache line per page) to keep all arena
+ * pages resident and warm in the TLB before each scan pass.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static void spray_pass(uint8_t *base) {
     volatile uint64_t *p = (volatile uint64_t *)base;
+    /* Stride = 4096 bytes / 8 bytes-per-word = 512 words.
+     * This touches exactly one word per 4 KB page — enough to fault
+     * pages back in if they were reclaimed, without thrashing L1.      */
     size_t stride = 4096 / sizeof(uint64_t);
     size_t total  = ARENA_SIZE / sizeof(uint64_t);
     for (size_t i = 0; i < total; i += stride) (void)p[i];
@@ -377,7 +580,11 @@ static void spray_pass(uint8_t *base) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static size_t scan_arena(uint8_t *base) {
-    uint64_t *words = (uint64_t *)base;
+    /* Cast to volatile: forces the compiler to issue a real load for every
+     * word.  Without this, -O2 may hoist or CSE reads from the non-volatile
+     * pointer, causing the scan to compare a stale register value against
+     * the expected sentinel — producing phantom flips, especially on ARM.  */
+    volatile uint64_t *words = (volatile uint64_t *)base;
     size_t total    = ARENA_SIZE / sizeof(uint64_t);
     size_t found    = 0;
     char   ts[32];
@@ -451,17 +658,19 @@ static size_t scan_arena(uint8_t *base) {
                    (unsigned long long)((observed >> PTE_BIT_RW) & 1),
                    (unsigned long long)((observed >> PTE_BIT_US) & 1),
                    (unsigned long long)((observed >> PTE_BIT_NX) & 1),
-                   (unsigned long long)((observed & PTE_ADDR_MASK) >> PTE_PA_SHIFT),
+                   (unsigned long long)((observed & PTE_PA_MASK) >> PTE_PA_SHIFT),
                    (unsigned long long)((diff >> PTE_BIT_P)  & 1),
                    (unsigned long long)((diff >> PTE_BIT_RW) & 1),
                    (unsigned long long)((diff >> PTE_BIT_US) & 1),
                    (unsigned long long)((diff >> PTE_BIT_NX) & 1),
-                   (unsigned long long)(!!(diff & PTE_ADDR_MASK)));
+                   (unsigned long long)(!!(diff & PTE_PA_MASK)));
         }
 
         fflush(stdout);
 
-        /* Restore sentinel */
+        /* Restore sentinel so the word isn't re-reported next scan.
+         * The volatile write ensures the store actually reaches the cache
+         * line and is not eliminated by the compiler.                   */
         words[i] = expected;
     }
 
@@ -485,17 +694,27 @@ static void build_report_json(char *buf, size_t bufsz, const ReportWindow *w) {
     FILE *f = fopen("/sys/devices/system/edac/mc/mc0/ce_count", "r");
     if (f) { ecc = 1; fclose(f); }
 
+    /* Build altitude string separately to avoid compound-literal in snprintf */
+    char alt_str[16];
+    if (opt_altitude >= 0)
+        snprintf(alt_str, sizeof(alt_str), "%d", opt_altitude);
+    else
+        snprintf(alt_str, sizeof(alt_str), "null");
+
+    /* Report window in hours (float) for the JSON field */
+    double window_hours = (double)opt_report_window / 3600.0;
+
     snprintf(buf, bufsz,
         "{\n"
-        "  \"schema_version\": \"1.0\",\n"
-        "  \"window_hours\": 72,\n"
+        "  \"schema_version\": \"1.1\",\n"
+        "  \"window_hours\": %.4g,\n"
         "  \"window_start\": \"%s\",\n"
         "  \"window_end\":   \"%s\",\n"
         "  \"platform\": {\n"
-        "    \"arch\":     \"%s\",\n"
-        "    \"os\":       \"%s %s\",\n"
-        "    \"ram_mb\":   %lu,\n"
-        "    \"ecc\":      %s,\n"
+        "    \"arch\":       \"%s\",\n"
+        "    \"os\":         \"%s %s\",\n"
+        "    \"ram_mb\":     %lu,\n"
+        "    \"ecc\":        %s,\n"
         "    \"altitude_m\": %s\n"
         "  },\n"
         "  \"flip_totals\": {\n"
@@ -510,10 +729,10 @@ static void build_report_json(char *buf, size_t bufsz, const ReportWindow *w) {
         "    \"PRIV_ESC\":            %llu,\n"
         "    \"CODE_PAGE\":           %llu,\n"
         "    \"PTE_PRESENT_CLEAR\":   %llu,\n"
-        "    \"PTE_WRITE_SET\":        %llu,\n"
-        "    \"PTE_NX_CLEAR\":         %llu,\n"
-        "    \"PTE_PHYS_CORRUPT\":     %llu,\n"
-        "    \"PTE_SUPERVISOR_ESC\":   %llu\n"
+        "    \"PTE_WRITE_SET\":       %llu,\n"
+        "    \"PTE_NX_CLEAR\":        %llu,\n"
+        "    \"PTE_PHYS_CORRUPT\":    %llu,\n"
+        "    \"PTE_SUPERVISOR_ESC\":  %llu\n"
         "  },\n"
         "  \"by_region\": {\n"
         "    \"POINTER\":    %llu,\n"
@@ -526,15 +745,12 @@ static void build_report_json(char *buf, size_t bufsz, const ReportWindow *w) {
         "  \"multi_bit_events\":   %llu,\n"
         "  \"scan_cycles\":        %llu\n"
         "}\n",
-        wstart, wend,
+        window_hours, wstart, wend,
         u.machine,
         u.sysname, u.release,
         si.totalram / (1024*1024),
         ecc ? "true" : "false",
-        (opt_altitude >= 0) ? ({
-            static char abuf[16];
-            snprintf(abuf, sizeof(abuf), "%d", opt_altitude);
-            abuf; }) : "null",
+        alt_str,
         /* flip_totals */
         (unsigned long long)w->total_bits,
         (unsigned long long)w->zero_to_one,
@@ -605,20 +821,24 @@ static void post_report(const char *json, const char *url) {
 static void post_report(const char *json, const char *url) {
     (void)json; (void)url;
     printf("[!] Built without curl — remote reporting disabled.\n"
-           "    Recompile with: make WITH_CURL=1\n");
+           "    Recompile with: gcc -DWITH_CURL ... -lcurl\n");
 }
 #endif
 
-/* ─── Emit 72-hour report ────────────────────────────────────────────────── */
+/* ─── Emit report at end of window ─────────────────────────────────────── */
 
 static void emit_report(void) {
     static char json[8192];
     report_win.window_end = time(NULL);
     build_report_json(json, sizeof(json), &report_win);
 
+    char dur[32];
+    fmt_duration(opt_report_window, dur, sizeof(dur));
+
     printf("\n╔══════════════════════════════════════╗\n"
-           "║      72-HOUR REPORT  (anonymised)    ║\n"
-           "╚══════════════════════════════════════╝\n%s\n", json);
+           "║   WINDOW REPORT  (%s, anonymised)%*s║\n"
+           "╚══════════════════════════════════════╝\n%s\n",
+           dur, (int)(14 - (int)strlen(dur)), " ", json);
 
     dump_report_to_file(json);
 
@@ -637,30 +857,51 @@ static void emit_report(void) {
 static void print_banner(void) {
     struct utsname u; uname(&u);
     struct sysinfo si; sysinfo(&si);
+    char dur[32];
+    fmt_duration(opt_report_window, dur, sizeof(dur));
+
+    int   in_container = detect_container();
+    int   ksm          = ksm_active();
+    const char *thp    = thp_policy();
+    uint64_t cg        = cgroup_mem_limit();
+
+    char cg_str[48] = "";
+    if (cg) snprintf(cg_str, sizeof(cg_str), "  (cgroup limit: %llu MB)",
+                     (unsigned long long)(cg / (1024*1024)));
 
     printf("╔═══════════════════════════════════════════════════╗\n"
            "║   ☄  CosmicRowhammer v%-6s  —  FuzzSociety      ║\n"
            "╚═══════════════════════════════════════════════════╝\n"
            "  Host      %s %s %s\n"
-           "  RAM       %lu MB\n"
+           "  RAM       %lu MB%s\n"
+           "  Container %s\n"
+           "  KSM       %s\n"
+           "  THP       %s (set to 'never' or 'madvise' for best results)\n"
            "  Arena     512 MB  /  5 regions  (~102 MB each)\n"
            "  Regions   POINTER | RETADDR | PERMISSION | DATA | PTE_SIM\n"
            "  Interval  %d s\n"
-           "  Reporting every 72 h%s\n"
+           "  Window    %s%s\n"
            "  Curl      %s\n",
            VERSION,
            u.sysname, u.release, u.machine,
-           si.totalram / (1024*1024),
+           si.totalram / (1024*1024), cg_str,
+           in_container ? "YES — THP/KSM mitigations applied" : "no",
+           ksm  ? "ACTIVE ⚠  (host KSM may merge arena pages — false positives possible)" : "off",
+           thp,
            opt_interval,
-           report_url[0] ? " → remote POST" : " → local JSON file",
+           dur,
+           report_url[0] ? " → remote POST" : " → local JSON",
 #ifdef WITH_CURL
            "enabled"
 #else
-           "disabled (recompile with WITH_CURL=1)"
+           "disabled (recompile with -DWITH_CURL)"
 #endif
     );
     if (opt_altitude >= 0)
         printf("  Altitude  %d m\n", opt_altitude);
+    if (in_container && ksm)
+        printf("\n  [!] KSM is active on the host. Add --cap-add SYS_ADMIN to suppress\n"
+               "      via MADV_UNMERGEABLE, or disable on host: echo 0 > /sys/kernel/mm/ksm/run\n");
     printf("\n");
 }
 
@@ -689,18 +930,38 @@ static void print_stats(time_t start) {
 
 static void parse_args(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--report-url") && i+1 < argc)
+        if (!strcmp(argv[i], "--report-url") && i+1 < argc) {
             snprintf(report_url, sizeof(report_url), "%s", argv[++i]);
-        else if (!strcmp(argv[i], "--altitude") && i+1 < argc)
+
+        } else if (!strcmp(argv[i], "--report-window") && i+1 < argc) {
+            long w = parse_report_window(argv[++i]);
+            if (w < 0) {
+                fprintf(stderr,
+                    "[-] Invalid --report-window '%s'\n"
+                    "    Examples: 10s  30m  6h  3d\n", argv[i]);
+                exit(1);
+            }
+            opt_report_window = w;
+
+        } else if (!strcmp(argv[i], "--altitude") && i+1 < argc) {
             opt_altitude = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--interval") && i+1 < argc)
+
+        } else if (!strcmp(argv[i], "--interval") && i+1 < argc) {
             opt_interval = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--help")) {
-            printf("Usage: cosmic_rowhammer [OPTIONS]\n"
-                   "  --report-url <url>   POST anonymised 72h JSON report\n"
-                   "  --altitude   <m>     Your altitude in metres (optional)\n"
-                   "  --interval   <s>     Scan interval in seconds (default %d)\n",
-                   SCAN_INTERVAL_S);
+
+        } else if (!strcmp(argv[i], "--help")) {
+            printf(
+                "Usage: cosmic_rowhammer [OPTIONS]\n\n"
+                "  --report-window <time>  Report flush interval (default: 3d)\n"
+                "                          Suffixes: s=seconds  m=minutes  h=hours  d=days\n"
+                "                          Examples: 10s  30m  6h  2d\n"
+                "  --report-url    <url>   POST anonymised JSON report to URL\n"
+                "  --altitude      <m>     Altitude in metres (logged in report)\n"
+                "  --interval      <s>     Scan interval in seconds (default: %d)\n\n"
+                "Examples:\n"
+                "  sudo ./cosmic_rowhammer --report-window 10s   # quick test\n"
+                "  sudo ./cosmic_rowhammer --report-window 3d --report-url https://...\n",
+                SCAN_INTERVAL_S);
             exit(0);
         }
     }
@@ -746,8 +1007,8 @@ int main(int argc, char *argv[]) {
             fflush(stdout);
         }
 
-        /* 72-hour report window */
-        if (time(NULL) - last_r >= REPORT_WINDOW_S) {
+        /* Configurable report window */
+        if (time(NULL) - last_r >= opt_report_window) {
             emit_report();
             last_r = time(NULL);
         }
