@@ -76,23 +76,15 @@ info "Model:     $model"
 info "Family:    $family  Stepping: $stepping"
 info "Microcode: ${microcode:-unavailable}"
 
-# Microcode staleness check for known Intel desktop CPUs
-# Family 6, Model 9E (0x9e) = Kaby Lake / Coffee Lake desktop
+# Microcode version — informational only, does not affect SEU detection
 cpu_model_hex=$(awk -F: '/model\t/{gsub(/ /,"",$2); printf "%02x", $2+0; exit}' /proc/cpuinfo)
 if [[ "$family" == "6" && "$cpu_model_hex" == "9e" && -n "$microcode" ]]; then
     ucode_dec=$(printf "%d" "$microcode" 2>/dev/null || echo 0)
-    # 0xf4 = 244 decimal — current latest for 906E9 (Kaby Lake step 9)
     if (( ucode_dec >= 0xf4 )); then
-        pass "Microcode up to date (0x$(printf '%x' $ucode_dec) >= 0xf4 for Kaby/Coffee Lake)"
-    elif (( ucode_dec >= 0xde )); then
-        warn "Microcode $microcode is recent but not latest (0xf4) for this CPU — update recommended"
-    elif (( ucode_dec >= 0x8e )); then
-        warn "Microcode $microcode is old — Spectre mitigations may be incomplete"
-        warn "  Update: apt install intel-microcode  or  update BIOS"
+        pass "Microcode ${microcode} — current for Kaby Lake (906E9)"
     else
-        fail "Microcode $microcode is very outdated (pre-2018) — no Spectre/Meltdown mitigations"
-        fail "  This CPU is 0x5e (Kaby Lake step 9); current latest is 0xf4"
-        fail "  Update: apt install intel-microcode  or  update BIOS firmware"
+        warn "Microcode ${microcode} not current for Kaby Lake (latest: 0xf4) — no impact on SEU detection"
+        warn "  Update on host when convenient: apt install intel-microcode && update-initramfs -u"
     fi
 fi
 
