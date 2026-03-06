@@ -223,12 +223,15 @@ sudo ./cosmic_rowhammer --report-url https://data.cosmicrowhammer.io/report
 sudo ./cosmic_rowhammer --interval 10
 
 # Higher altitude? Tell us
-sudo ./cosmic_rowhammer --altitude 2300 --report-url https://data.cosmicrowhammer.io/report
+sudo ./cosmic_rowhammer --altitude 2300 --report-url http://cosmos.fuzzsociety.org/report
 
 # Hyper conservative mode (capabilities)
 
 sudo setcap cap_ipc_lock+ep ./cosmic_rowhammer
 ./cosmic_rowhammer   # no sudo needed, ever again
+
+example report every 3days
+./cosmic_rowhammer --report-url http://cosmos.fuzzsociety.org:5000/report --report-window 3d
 ```
 
 ### Example Output
