@@ -262,18 +262,30 @@ example report every 3days
 ---
 
 ## The PTE Attack Scenario
+To understand why PTE flips matter, consider not a single target but the full physical memory landscape of a running Linux system:
 
-To understand why PTE flips matter, consider the following scenario on a standard Linux system:
+Physical DRAM
+┌──────────────────────────────────────────────────────────────────┐
+│  PD page │ data │ PT page │ PD page │ data │ PT page │ PT page   │
+│      ↑              ↑          ↑                 ↑               │
+│                any of these can be hit                           │
+└──────────────────────────────────────────────────────────────────┘
+                         ↑
+               cosmic ray hits anywhere
+
+A loaded Linux system has thousands of page table pages scattered across physical DRAM. A cosmic ray does not need to target a specific PTE — it just needs to land in any of the many physical locations containing page table structures.
+The impact scales with the level of the page table hierarchy hit:
 
 ```
-User process virtual address  →  PTE in kernel page tables  →  Physical DRAM frame
-                                      ↑
-                              A cosmic ray hits here
+leaf PTE flip:    1 page  (4KB)  remapped  →  limited impact
+PD entry flip:    512 pages (2MB) remapped  →  entire PT subtree injected
+PDPT entry flip:  1GB remapped              →  massive VA range hijacked
+PML4 entry flip:  512GB remapped            →  essentially full process space
 ```
 
-If the **NX bit** (bit 63) of a PTE flips from 1→0, a page previously mapped as non-executable (e.g. a heap allocation) silently becomes executable. An attacker who can spray shellcode into that region — something many heap sprays already accomplish — now has an **execution primitive delivered by physics**.
-
-CosmicRowhammer does not access real kernel PTEs (that would require ring 0). Instead, it demonstrates that **structurally valid PTE values, stored in observable DRAM, are susceptible to exactly this class of flip** — and quantifies the frequency.
+A single bit flip at a higher page table level does not remap one page — it grafts an entire crafted subtree into the victim process's virtual address space. The process walks right into it, none the wiser: no segfault, no permission violation, no kernel alarm — because the page table walk succeeds, just not where the process expected.
+The attack surface is not a point. It is a distribution over physical memory — which is exactly what CosmicRowhammer measures.
+CosmicRowhammer does not access real kernel PTEs (that would require ring 0). Instead, it demonstrates that structurally valid PTE values, distributed across a wide observable DRAM region, are susceptible to exactly this class of flip — and quantifies the spatial and temporal probability distribution of such events across real hardware.
 
 ---
 
