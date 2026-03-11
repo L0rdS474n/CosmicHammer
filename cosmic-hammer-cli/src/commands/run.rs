@@ -115,30 +115,37 @@ pub fn execute(
 
         // d. Process events
         if events.is_empty() {
-            println!("[{}] Scan #{} \u{2014} no flips", timestamp_now(), scan_cycles);
-        }
-        for event in &events {
-            total_flips += 1;
-            session_by_class[event.flip_class as usize] += 1;
-            report.record_flip(
-                event.flip_class,
-                event.region,
-                event.direction.as_int(),
-                event.n_bits,
+            // Overwrite same line so header stays visible
+            print!(
+                "\r[{}] Scan #{} \u{2014} no flips        ",
+                timestamp_now(),
+                scan_cycles
             );
+            std::io::stdout().flush().ok();
+        } else {
+            // Move past the \r status line before printing flip details
+            println!();
+            for event in &events {
+                total_flips += 1;
+                session_by_class[event.flip_class as usize] += 1;
+                report.record_flip(
+                    event.flip_class,
+                    event.region,
+                    event.direction.as_int(),
+                    event.n_bits,
+                );
 
-            // Print event to stdout (headless / no-TUI mode)
-            print_flip_event(event, total_flips);
-        }
-        if !events.is_empty() {
+                // Print event to stdout (headless / no-TUI mode)
+                print_flip_event(event, total_flips);
+            }
             println!(
                 "[{}] Scan #{} \u{2014} {} flip(s)",
                 timestamp_now(),
                 scan_cycles,
                 events.len()
             );
+            std::io::stdout().flush().ok();
         }
-        std::io::stdout().flush().ok();
 
         // e. Check report window timer
         let now = current_unix_secs();
