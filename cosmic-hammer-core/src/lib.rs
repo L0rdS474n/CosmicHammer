@@ -26,3 +26,27 @@ pub const FILL_DATA_B: u64 = 0x5555555555555555;
 pub const VERSION: &str = "1.0.0";
 pub const MAX_FLIPS: usize = 8192;
 pub const DEFAULT_REPORT_SECS: i64 = 72 * 3600; // 72 hours
+pub const DEFAULT_REPORT_URL: &str = "http://cosmos.fuzzsociety.org:5000/report";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // T1: Given the DEFAULT_REPORT_URL constant, when inspected, then its value
+    // matches the expected hard-coded URL string exactly.
+    #[test]
+    fn given_default_report_url_constant_when_inspected_then_value_matches_expected() {
+        assert_eq!(DEFAULT_REPORT_URL, "http://cosmos.fuzzsociety.org:5000/report");
+    }
+
+    // T2: Given DEFAULT_REPORT_URL, when inspected, then it starts with the "http://"
+    // scheme prefix (confirming it is not HTTPS and is not empty).
+    #[test]
+    fn given_default_report_url_when_inspected_then_starts_with_http() {
+        assert!(
+            DEFAULT_REPORT_URL.starts_with("http://"),
+            "DEFAULT_REPORT_URL must start with 'http://', got: {}",
+            DEFAULT_REPORT_URL
+        );
+    }
+}

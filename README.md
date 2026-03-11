@@ -6,6 +6,10 @@
 
 This is **not an attack tool**. It does not hammer memory. It *listens*.
 
+> **Note:** This is a **Rust rewrite** of the original C implementation by Dr. Antonio Nappa / FuzzSociety.
+> The original project lives at [fuzz-society/cosmic-rowhammer](https://github.com/fuzz-society/cosmic-rowhammer).
+> This fork adds a modular Rust workspace with multi-architecture PTE support (x86-64, ARM64, RISC-V), a TUI dashboard, cross-platform builds (Linux, macOS, Windows), and 222+ tests.
+
 ---
 
 ## ⚠️ DISCLAIMER — READ BEFORE RUNNING
@@ -188,25 +192,23 @@ No IP address is logged server-side beyond the standard 24-hour nginx rolling wi
 ## Build
 
 ```bash
-# Dependencies: gcc, glibc, libcurl (optional, for remote reporting)
-git clone https://github.com/fuzz-society/cosmic-rowhammer
-cd cosmic-rowhammer
-make
-
-# With remote reporting support
-make WITH_CURL=1
+# Requires: Rust toolchain (rustup.rs)
+git clone https://github.com/L0rdS474n/CosmicHammer.git
+cd CosmicHammer
+cargo build --release
 ```
 
 ### Requirements
 
 | | Minimum | Recommended |
 |---|---|---|
+| Rust | 1.70+ | stable latest |
 | RAM | 1 GB free | 2 GB free |
 | Privileges | user | root (for `mlock`) |
-| OS | Linux 4.x+ | Linux 6.x |
-| Arch | x86_64 | x86_64 / ARM64 |
+| OS | Linux 4.x+ / macOS / Windows | Linux 6.x |
+| Arch | x86_64 | x86_64 / ARM64 / RISC-V |
 
-> **Root is recommended** to guarantee physical page pinning via `mlock()`. Without it, the OS may silently swap or remap pages, producing false negatives.
+> **Root is recommended** on Linux to guarantee physical page pinning via `mlock()`. Without it, the OS may silently swap or remap pages, producing false negatives.
 
 ---
 
@@ -214,24 +216,26 @@ make WITH_CURL=1
 
 ```bash
 # Local observation only
-sudo ./cosmic_rowhammer
+sudo cosmic-hammer run
 
-# With 72-hour anonymous reporting
-sudo ./cosmic_rowhammer --report-url https://data.cosmicrowhammer.io/report
+# With anonymous reporting (default URL: cosmos.fuzzsociety.org:5000)
+sudo cosmic-hammer run --report-url
+
+# With a custom report endpoint
+sudo cosmic-hammer run --report-url http://your-server.example.com/report
 
 # Custom scan interval (seconds)
-sudo ./cosmic_rowhammer --interval 10
+sudo cosmic-hammer run --interval 10
 
-# Higher altitude? Tell us
-sudo ./cosmic_rowhammer --altitude 2300 --report-url http://cosmos.fuzzsociety.org/report
+# Higher altitude? Tell us — cosmic ray rate increases with elevation
+sudo cosmic-hammer run --altitude 2300 --report-url
 
-# Hyper conservative mode (capabilities)
+# Report every 3 days
+sudo cosmic-hammer run --report-url --report-window 3d
 
-sudo setcap cap_ipc_lock+ep ./cosmic_rowhammer
-./cosmic_rowhammer   # no sudo needed, ever again
-
-example report every 3days
-./cosmic_rowhammer --report-url http://cosmos.fuzzsociety.org:5000/report --report-window 3d
+# Hyper conservative mode (Linux capabilities, no sudo needed)
+sudo setcap cap_ipc_lock+ep ./target/release/cosmic-hammer
+./target/release/cosmic-hammer run
 ```
 
 ### Example Output
@@ -315,11 +319,10 @@ If CosmicRowhammer contributes to your research, please cite:
 
 Pull requests welcome. Particularly interested in:
 
-- **ARM64 / Apple Silicon** port (different DRAM geometry)
 - **ECC detection** — identifying which flips ECC silently corrected
 - **Altitude correlation** — runs above 2000m are especially valuable
 - **DRAM vendor fingerprinting** — manufacturer-specific flip rate analysis
-- **Windows port** — `VirtualLock()` equivalent path
+- **Platform testing** — ARM64, RISC-V and Windows builds exist but need real-hardware validation
 
 ---
 

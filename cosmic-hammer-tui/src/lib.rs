@@ -3,6 +3,8 @@
 pub mod app;
 pub mod input;
 pub mod layout;
+#[cfg(feature = "flip-sound")]
+pub mod sound;
 pub mod theme;
 pub mod widgets;
 
@@ -43,7 +45,22 @@ const DEFAULT_REGION_SIZE_MB: u64 = 102;
 /// The TUI receives events from the scanner through an `mpsc::Receiver<TuiMessage>`.
 /// It initializes the terminal in raw mode with an alternate screen, runs the
 /// event loop, and restores the terminal on exit.
-pub fn run_tui(rx: Receiver<TuiMessage>) -> Result<(), CosmicError> {
+///
+/// When `flip_sound` is true and the `flip-sound` feature is enabled, a retro
+/// sound effect plays once per scan cycle that detects flips.
+pub fn run_tui(rx: Receiver<TuiMessage>, flip_sound: bool) -> Result<(), CosmicError> {
+    // Initialize sound if requested
+    #[cfg(feature = "flip-sound")]
+    let sounder = if flip_sound {
+        sound::FlipSounder::new()
+    } else {
+        None
+    };
+    #[cfg(not(feature = "flip-sound"))]
+    if flip_sound {
+        tracing::warn!("--flip-sound requested but binary compiled without flip-sound feature");
+    }
+
     // Initialize terminal
     enable_raw_mode().map_err(CosmicError::Io)?;
     let mut stdout = io::stdout();
@@ -53,7 +70,13 @@ pub fn run_tui(rx: Receiver<TuiMessage>) -> Result<(), CosmicError> {
 
     let mut app = App::new();
 
-    let result = run_event_loop(&mut terminal, &mut app, &rx);
+    let result = run_event_loop(
+        &mut terminal,
+        &mut app,
+        &rx,
+        #[cfg(feature = "flip-sound")]
+        &sounder,
+    );
 
     // Restore terminal regardless of result
     let _ = disable_raw_mode();
@@ -68,8 +91,11 @@ fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     rx: &Receiver<TuiMessage>,
+    #[cfg(feature = "flip-sound")] sounder: &Option<sound::FlipSounder>,
 ) -> Result<(), CosmicError> {
     let poll_timeout = Duration::from_millis(250);
+    #[cfg(feature = "flip-sound")]
+    let mut flips_in_current_cycle = false;
 
     while app.is_running() {
         // Draw the current frame
@@ -124,9 +150,22 @@ fn run_event_loop(
             match msg {
                 TuiMessage::FlipDetected(flip_event) => {
                     app.add_event(flip_event);
+                    #[cfg(feature = "flip-sound")]
+                    {
+                        flips_in_current_cycle = true;
+                    }
                 }
                 TuiMessage::ScanComplete => {
                     app.increment_scans();
+                    #[cfg(feature = "flip-sound")]
+                    {
+                        if flips_in_current_cycle {
+                            if let Some(ref s) = sounder {
+                                s.play();
+                            }
+                        }
+                        flips_in_current_cycle = false;
+                    }
                 }
                 TuiMessage::Shutdown => {
                     app.running = false;
@@ -235,5 +274,19 @@ mod tests {
         // but we verify no runtime error occurs.
         let event = make_test_event();
         print_headless_flip(&event);
+    }
+
+    // T5: Given run_tui's public signature, when type-checked at compile time,
+    // then it accepts (Receiver<TuiMessage>, bool) and returns Result<(), CosmicError>.
+    // This is a compile-time-only test: no runtime call is made because run_tui
+    // initialises a real terminal (raw mode, alternate screen).
+    #[test]
+    fn given_run_tui_signature_when_type_checked_then_accepts_receiver_and_bool() {
+        use std::sync::mpsc;
+        // Obtain a function pointer whose type is precisely the declared signature.
+        // If run_tui's signature ever changes to incompatible types, this line
+        // will fail to compile, catching the regression immediately.
+        let _fn_ptr: fn(mpsc::Receiver<TuiMessage>, bool) -> Result<(), CosmicError> = run_tui;
+        // No runtime invocation — we only verify the type is correct.
     }
 }

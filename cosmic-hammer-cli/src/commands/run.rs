@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,6 +13,7 @@ use cosmic_hammer_platform::{
 use cosmic_hammer_pte::{arm64::Arm64Pte, riscv::RiscvSv39Pte, x86_64::X86_64Pte, PteModel};
 use cosmic_hammer_report::{build_report_json, dump_report_to_file};
 use cosmic_hammer_scanner::Arena;
+use cosmic_hammer_tui::TuiMessage;
 
 use crate::signals::setup_signal_handler;
 
@@ -24,8 +26,9 @@ pub fn execute(
     interval: u32,
     _threads: usize,
     pte_model_str: &str,
-    _no_tui: bool,
+    no_tui: bool,
     arena_size_mb: usize,
+    flip_sound: bool,
 ) -> anyhow::Result<()> {
     // 1. Parse report window
     let window_secs = parse_report_window(report_window_str).ok_or_else(|| {
@@ -83,7 +86,47 @@ pub fn execute(
     // 7. Setup signal handler
     let running = setup_signal_handler();
 
-    // 8. Initialize report window
+    if no_tui {
+        run_headless(
+            &mut arena,
+            &running,
+            window_secs,
+            report_url,
+            altitude,
+            interval,
+            &arch,
+            &os_info,
+            ram_mb,
+        )
+    } else {
+        run_with_tui(
+            arena,
+            running,
+            window_secs,
+            report_url.map(|s| s.to_string()),
+            altitude,
+            interval,
+            arch,
+            os_info,
+            ram_mb,
+            flip_sound,
+        )
+    }
+}
+
+/// Run the scanner in headless mode (no TUI), printing to stdout.
+#[allow(clippy::too_many_arguments)]
+fn run_headless(
+    arena: &mut Arena,
+    running: &Arc<AtomicBool>,
+    window_secs: i64,
+    report_url: Option<&str>,
+    altitude: Option<i32>,
+    interval: u32,
+    arch: &str,
+    os_info: &str,
+    ram_mb: u64,
+) -> anyhow::Result<()> {
     let now_secs = current_unix_secs();
     let mut report = ReportWindow::new(now_secs);
     let mut next_report_at = now_secs + window_secs;
@@ -96,26 +139,19 @@ pub fn execute(
     println!("[*] Scanning... press Ctrl-C to stop.");
     println!();
 
-    // 9. Main loop (matches C: spray -> sleep -> scan -> process)
     while running.load(Ordering::SeqCst) {
-        // a. Spray pass: touch one word per 4KB page to keep pages resident
-        //    (matches C's spray_pass, not a full re-fill)
         arena.spray_pass();
 
-        // b. Sleep for interval
-        sleep_interruptible(Duration::from_secs(interval as u64), &running);
+        sleep_interruptible(Duration::from_secs(interval as u64), running);
         if !running.load(Ordering::SeqCst) {
             break;
         }
 
-        // c. Scan for flips (volatile reads, sentinel restore on mismatch)
         let events = arena.scan();
         scan_cycles += 1;
         report.scan_cycles = scan_cycles;
 
-        // d. Process events
         if events.is_empty() {
-            // Overwrite same line so header stays visible
             print!(
                 "\r[{}] Scan #{} \u{2014} no flips        ",
                 timestamp_now(),
@@ -123,7 +159,6 @@ pub fn execute(
             );
             std::io::stdout().flush().ok();
         } else {
-            // Move past the \r status line before printing flip details
             println!();
             for event in &events {
                 total_flips += 1;
@@ -134,8 +169,6 @@ pub fn execute(
                     event.direction.as_int(),
                     event.n_bits,
                 );
-
-                // Print event to stdout (headless / no-TUI mode)
                 print_flip_event(event, total_flips);
             }
             println!(
@@ -147,7 +180,6 @@ pub fn execute(
             std::io::stdout().flush().ok();
         }
 
-        // e. Check report window timer
         let now = current_unix_secs();
         if now >= next_report_at {
             report.window_end = now;
@@ -155,8 +187,8 @@ pub fn execute(
                 &report,
                 window_secs,
                 altitude,
-                &arch,
-                &os_info,
+                arch,
+                os_info,
                 ram_mb,
                 report_url,
             );
@@ -165,7 +197,6 @@ pub fn execute(
         }
     }
 
-    // 10. On exit: emit final report and print stats
     println!();
     println!("[*] Interrupted -- finalizing...");
 
@@ -174,12 +205,143 @@ pub fn execute(
         &report,
         window_secs,
         altitude,
-        &arch,
-        &os_info,
+        arch,
+        os_info,
         ram_mb,
         report_url,
     );
 
+    print_session_stats(&session_by_class, total_flips, scan_cycles, &start_time);
+    Ok(())
+}
+
+/// Data returned from the scanner thread for final stats.
+struct ScannerResult {
+    total_flips: u64,
+    scan_cycles: u64,
+    session_by_class: [u64; FlipClass::COUNT],
+    start_time: SystemTime,
+}
+
+/// Run the scanner with TUI dashboard.
+#[allow(clippy::too_many_arguments)]
+fn run_with_tui(
+    mut arena: Arena,
+    running: Arc<AtomicBool>,
+    window_secs: i64,
+    report_url: Option<String>,
+    altitude: Option<i32>,
+    interval: u32,
+    arch: String,
+    os_info: String,
+    ram_mb: u64,
+    flip_sound: bool,
+) -> anyhow::Result<()> {
+    let (tx, rx) = mpsc::channel::<TuiMessage>();
+
+    let scanner_running = Arc::clone(&running);
+    let scanner_handle = std::thread::spawn(move || -> ScannerResult {
+        let now_secs = current_unix_secs();
+        let mut report = ReportWindow::new(now_secs);
+        let mut next_report_at = now_secs + window_secs;
+        let mut scan_cycles: u64 = 0;
+        let mut total_flips: u64 = 0;
+        let mut session_by_class = [0u64; FlipClass::COUNT];
+        let start_time = SystemTime::now();
+
+        while scanner_running.load(Ordering::SeqCst) {
+            arena.spray_pass();
+
+            sleep_interruptible(Duration::from_secs(interval as u64), &scanner_running);
+            if !scanner_running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let events = arena.scan();
+            scan_cycles += 1;
+            report.scan_cycles = scan_cycles;
+
+            for event in &events {
+                total_flips += 1;
+                session_by_class[event.flip_class as usize] += 1;
+                report.record_flip(
+                    event.flip_class,
+                    event.region,
+                    event.direction.as_int(),
+                    event.n_bits,
+                );
+                // Send to TUI (ignore error if TUI has exited)
+                let _ = tx.send(TuiMessage::FlipDetected(event.clone()));
+            }
+            let _ = tx.send(TuiMessage::ScanComplete);
+
+            let now = current_unix_secs();
+            if now >= next_report_at {
+                report.window_end = now;
+                emit_report(
+                    &report,
+                    window_secs,
+                    altitude,
+                    &arch,
+                    &os_info,
+                    ram_mb,
+                    report_url.as_deref(),
+                );
+                report.reset(now);
+                next_report_at = now + window_secs;
+            }
+        }
+
+        // Send shutdown to TUI
+        let _ = tx.send(TuiMessage::Shutdown);
+
+        // Emit final report
+        report.window_end = current_unix_secs();
+        emit_report(
+            &report,
+            window_secs,
+            altitude,
+            &arch,
+            &os_info,
+            ram_mb,
+            report_url.as_deref(),
+        );
+
+        ScannerResult {
+            total_flips,
+            scan_cycles,
+            session_by_class,
+            start_time,
+        }
+    });
+
+    // Run TUI on main thread (blocks until user quits or Ctrl-C)
+    let tui_result = cosmic_hammer_tui::run_tui(rx, flip_sound);
+
+    // Signal scanner thread to stop (in case TUI exited via 'q')
+    running.store(false, Ordering::SeqCst);
+
+    // Wait for scanner thread
+    let result = scanner_handle.join().expect("scanner thread panicked");
+
+    // Print session stats after TUI has restored terminal
+    print_session_stats(
+        &result.session_by_class,
+        result.total_flips,
+        result.scan_cycles,
+        &result.start_time,
+    );
+
+    tui_result.map_err(|e| anyhow::anyhow!("TUI error: {}", e))
+}
+
+/// Print session statistics on exit.
+fn print_session_stats(
+    session_by_class: &[u64; FlipClass::COUNT],
+    total_flips: u64,
+    scan_cycles: u64,
+    start_time: &SystemTime,
+) {
     let runtime_secs = start_time.elapsed().map(|d| d.as_secs()).unwrap_or(0);
     println!();
     println!("\u{2500}\u{2500}\u{2500} Session Stats \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}");
@@ -197,8 +359,6 @@ pub fn execute(
     }
     println!("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}");
     println!("[*] Arena released. Goodbye.");
-
-    Ok(())
 }
 
 /// Select the PTE model based on the user's --pte-model argument.

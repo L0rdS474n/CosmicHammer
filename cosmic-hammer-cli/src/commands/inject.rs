@@ -8,7 +8,7 @@ use cosmic_hammer_pte::{x86_64::X86_64Pte, PteModel};
 
 /// Allocate a small arena, fill it, manually flip a bit, scan, and display the
 /// result. This is a testing/demo command to verify detection pipeline.
-pub fn execute() -> anyhow::Result<()> {
+pub fn execute(flip_sound: bool) -> anyhow::Result<()> {
     println!("[inject] Allocating 1 MB test arena...");
 
     let config = ArenaConfig::new(1);
@@ -49,6 +49,9 @@ pub fn execute() -> anyhow::Result<()> {
     }
 
     // Now scan the data region to find the flip
+    // SAFETY: inject_offset equals data_region_offset which was bounds-checked
+    // above; ptr is valid for the full arena length; u64 alignment is guaranteed
+    // by the 8-byte slot stride; the memory was written in the preceding block.
     let observed = unsafe {
         let slot = ptr.add(inject_offset) as *const u64;
         slot.read()
@@ -90,6 +93,19 @@ pub fn execute() -> anyhow::Result<()> {
     println!();
     println!("[inject] Detected injected flip:");
     print_flip_event(&event, &*pte_model);
+    #[cfg(feature = "flip-sound")]
+    if flip_sound {
+        if let Some(sounder) = cosmic_hammer_tui::sound::FlipSounder::new() {
+            sounder.play();
+            // Allow the fire-and-forget sink time to finish playing before exit
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        }
+    }
+    #[cfg(not(feature = "flip-sound"))]
+    if flip_sound {
+        println!("[inject] --flip-sound requested but binary compiled without flip-sound feature");
+    }
+
     println!();
     println!("[inject] Inject test complete.");
 
@@ -105,4 +121,23 @@ fn print_flip_event(event: &FlipEvent, _pte_model: &dyn PteModel) {
         "        expected=0x{:016X}  observed=0x{:016X}  bits={}  row={}",
         event.expected, event.observed, event.n_bits, event.dram_row,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // T11: Given inject::execute is called with flip_sound = false, when it runs,
+    // then it returns Ok(()).
+    //
+    // WARNING: This test performs a real OS-level memory allocation of 1 MB
+    // (VirtualAlloc on Windows, mmap on Linux/macOS). This is intentional — the
+    // inject command is specifically a live integration smoke-test of the detection
+    // pipeline. The test does NOT make any network calls and does NOT write
+    // persistent files.
+    #[test]
+    fn given_inject_execute_when_called_with_flip_sound_false_then_returns_ok() {
+        let result = execute(false);
+        assert!(result.is_ok(), "execute(false) must return Ok(()), got: {:?}", result.err());
+    }
 }

@@ -22,6 +22,7 @@ fn main() -> anyhow::Result<()> {
             pte_model,
             no_tui,
             arena_size,
+            flip_sound,
         } => {
             commands::run::execute(
                 &report_window,
@@ -32,6 +33,7 @@ fn main() -> anyhow::Result<()> {
                 &pte_model,
                 no_tui,
                 arena_size,
+                flip_sound,
             )?;
         }
         Commands::Syscheck => {
@@ -40,8 +42,8 @@ fn main() -> anyhow::Result<()> {
         Commands::Report { file } => {
             commands::report::execute(&file)?;
         }
-        Commands::Inject => {
-            commands::inject::execute()?;
+        Commands::Inject { flip_sound } => {
+            commands::inject::execute(flip_sound)?;
         }
     }
 
