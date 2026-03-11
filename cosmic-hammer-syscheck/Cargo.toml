@@ -1,0 +1,12 @@
+[package]
+name = "cosmic-hammer-syscheck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cosmic-hammer-core = { path = "../cosmic-hammer-core" }
+cosmic-hammer-platform = { path = "../cosmic-hammer-platform" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

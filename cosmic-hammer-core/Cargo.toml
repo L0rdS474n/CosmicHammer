@@ -1,0 +1,13 @@
+[package]
+name = "cosmic-hammer-core"
+version = "1.0.0"
+edition = "2021"
+license = "BSD-2-Clause"
+description = "Core types and classification logic for CosmicHammer cosmic-ray bit-flip detector"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"

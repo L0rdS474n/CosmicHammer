@@ -1,0 +1,14 @@
+[package]
+name = "cosmic-hammer-scanner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cosmic-hammer-core = { path = "../cosmic-hammer-core" }
+cosmic-hammer-platform = { path = "../cosmic-hammer-platform" }
+cosmic-hammer-pte = { path = "../cosmic-hammer-pte" }
+
+[dev-dependencies]
+cosmic-hammer-platform = { path = "../cosmic-hammer-platform" }
+cosmic-hammer-pte = { path = "../cosmic-hammer-pte" }

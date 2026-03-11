@@ -1,0 +1,8 @@
+[package]
+name = "cosmic-hammer-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cosmic-hammer-core = { path = "../cosmic-hammer-core" }

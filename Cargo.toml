@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "cosmic-hammer-core",
+    "cosmic-hammer-platform",
+    "cosmic-hammer-pte",
+    "cosmic-hammer-scanner",
+    "cosmic-hammer-tui",
+    "cosmic-hammer-report",
+    "cosmic-hammer-syscheck",
+    "cosmic-hammer-plugin",
+    "cosmic-hammer-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "BSD-2-Clause"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
